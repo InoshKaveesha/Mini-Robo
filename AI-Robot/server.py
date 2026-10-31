@@ -7,6 +7,7 @@ import threading
 import traceback
 import shutil
 import subprocess
+import urllib.parse
 
 import requests
 import pyttsx3
@@ -42,6 +43,7 @@ app = FastAPI(title="ESP32 AI Robot")
 
 load_dotenv()
 OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY")
+WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "en")  # Default to English (prevents foreign hallucinations on static)
 
 OLLAMA_URL = "https://ollama.com/api/chat"
 MODEL = "beam:cloud"
@@ -56,6 +58,19 @@ whisper = WhisperModel(
 print("Whisper model loaded successfully!")
 
 tts_lock = threading.Lock()
+
+
+def safe_header(text, max_len=200):
+    """Ensure HTTP headers only contain latin-1/ASCII characters (RFC standard)."""
+    if not text:
+        return ""
+    clean = text.replace("\r", " ").replace("\n", " ").strip()[:max_len]
+    try:
+        clean.encode("latin-1")
+        return clean
+    except UnicodeEncodeError:
+        # Fallback to URL-encoded ASCII for any non-latin-1 Unicode text
+        return urllib.parse.quote(clean)
 
 
 @app.get("/")
@@ -192,6 +207,7 @@ async def voice(request: Request):
             print("--> [Step 2] Transcribing with Whisper...")
             segments, info = whisper.transcribe(
                 input_path,
+                language=WHISPER_LANGUAGE if WHISPER_LANGUAGE else None,
                 beam_size=1
             )
             transcript = " ".join(
@@ -217,8 +233,8 @@ async def voice(request: Request):
             content=speech,
             media_type="audio/wav",
             headers={
-                "X-Transcript": transcript[:200],
-                "X-Robot-Reply": answer[:200]
+                "X-Transcript": safe_header(transcript),
+                "X-Robot-Reply": safe_header(answer)
             }
         )
 
