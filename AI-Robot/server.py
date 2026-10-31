@@ -1,20 +1,24 @@
 
 import io
 import os
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 import tempfile
 import wave
 import threading
 
 import requests
 import pyttsx3
+from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import Response
 from faster_whisper import WhisperModel
 
 app = FastAPI(title="ESP32 AI Robot")
 
-OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
-MODEL = "llama3.2:1b"
+load_dotenv()
+OLLAMA_API_KEY=os.getenv("OLLAMA_API_KEY")
+OLLAMA_URL="https://ollama.com/api/chat"
+MODEL="beam:cloud"
 
 # Load the speech-recognition model once.
 # First startup may download the model.
@@ -31,8 +35,19 @@ tts_lock = threading.Lock()
 def home():
     return {
         "status": "Robot AI server is running!",
-        "voice_endpoint": "/voice"
+        "voice_endpoint": "/voice",
+        "chat_endpoint": "/chat"
     }
+
+
+@app.post("/chat")
+async def chat(request: Request):
+    data = await request.json()
+    message = data.get("message", "")
+    if not message:
+        raise HTTPException(400, "Missing 'message' in request body")
+    reply = ask_ai(message)
+    return {"reply": reply}
 
 
 def make_wav(pcm_bytes, sample_rate=16000):
@@ -49,23 +64,36 @@ def make_wav(pcm_bytes, sample_rate=16000):
 
 
 def ask_ai(message):
+    headers = {}
+    if OLLAMA_API_KEY:
+        headers["Authorization"] = f"Bearer {OLLAMA_API_KEY}"
+
     response = requests.post(
         OLLAMA_URL,
+        headers=headers,
         json={
             "model": MODEL,
-            "prompt": (
-                "You are a friendly educational robot. "
-                "Give short, natural answers suitable for speaking. "
-                "Reply in the same language as the user. "
-                "Support Sinhala and English when possible.\n\n"
-                f"User: {message}\nRobot:"
-            ),
-            "stream": False
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a friendly educational robot. "
+                        "Give short, natural answers suitable for speaking. "
+                        "Reply in the same language as the user."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": message,
+                },
+            ],
+            "stream": False,
         },
-        timeout=180
+        timeout=180,
     )
     response.raise_for_status()
-    return response.json()["response"].strip()
+    data = response.json()
+    return data["message"]["content"].strip()
 
 
 def make_speech_wav(text):
@@ -148,3 +176,8 @@ async def voice(request: Request):
     except Exception as error:
         print("VOICE ERROR:", repr(error))
         raise HTTPException(500, str(error))
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
