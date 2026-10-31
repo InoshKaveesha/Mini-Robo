@@ -17,6 +17,7 @@ app = FastAPI(title="ESP32 AI Robot")
 
 load_dotenv()
 OLLAMA_API_KEY=os.getenv("OLLAMA_API_KEY")
+
 OLLAMA_URL="https://ollama.com/api/chat"
 MODEL="beam:cloud"
 
