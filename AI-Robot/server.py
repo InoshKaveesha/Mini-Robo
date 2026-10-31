@@ -1,33 +1,50 @@
-
 import io
 import os
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 import tempfile
 import wave
 import threading
+import traceback
 
 import requests
 import pyttsx3
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import Response
+
+# Fix compatibility between PyAV and faster-whisper (metadata_errors was removed in newer PyAV versions)
+import av
+_orig_av_open = av.open
+def _safe_av_open(*args, **kwargs):
+    kwargs.pop("metadata_errors", None)
+    return _orig_av_open(*args, **kwargs)
+av.open = _safe_av_open
+
+try:
+    import audioop
+except ImportError:
+    raise RuntimeError(
+        "Missing 'audioop' module. On Python 3.13+, run: pip install audioop-lts"
+    )
+
 from faster_whisper import WhisperModel
 
 app = FastAPI(title="ESP32 AI Robot")
 
 load_dotenv()
-OLLAMA_API_KEY=os.getenv("OLLAMA_API_KEY")
+OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY")
 
-OLLAMA_URL="https://ollama.com/api/chat"
-MODEL="beam:cloud"
+OLLAMA_URL = "https://ollama.com/api/chat"
+MODEL = "beam:cloud"
 
 # Load the speech-recognition model once.
-# First startup may download the model.
+print("Loading Whisper model...")
 whisper = WhisperModel(
     "base",
     device="cpu",
     compute_type="int8"
 )
+print("Whisper model loaded successfully!")
 
 tts_lock = threading.Lock()
 
@@ -117,8 +134,6 @@ def make_speech_wav(text):
                 frames = source.readframes(source.getnframes())
 
             # Convert samples to signed 16-bit mono.
-            import audioop
-
             if width != 2:
                 frames = audioop.lin2lin(frames, width, 2)
 
@@ -137,9 +152,10 @@ def make_speech_wav(text):
 async def voice(request: Request):
     # ESP32 sends raw, mono, 16-bit PCM at 16 kHz.
     pcm = await request.body()
+    print(f"\n--> [Step 1] Received {len(pcm)} bytes of PCM audio from ESP32")
 
     if len(pcm) < 4000:
-        raise HTTPException(400, "Audio is too short")
+        raise HTTPException(400, "Audio is too short (< 0.25s)")
 
     try:
         with tempfile.NamedTemporaryFile(
@@ -149,6 +165,7 @@ async def voice(request: Request):
             input_path = temp.name
 
         try:
+            print("--> [Step 2] Transcribing with Whisper...")
             segments, info = whisper.transcribe(
                 input_path,
                 beam_size=1
@@ -156,14 +173,21 @@ async def voice(request: Request):
             transcript = " ".join(
                 segment.text.strip() for segment in segments
             ).strip()
+            print(f"    Transcript: '{transcript}'")
         finally:
-            os.unlink(input_path)
+            if os.path.exists(input_path):
+                os.unlink(input_path)
 
         if not transcript:
             transcript = "Please ask me a question."
 
+        print("--> [Step 3] Asking AI (Ollama)...")
         answer = ask_ai(transcript)
+        print(f"    AI Answer: '{answer}'")
+
+        print("--> [Step 4] Synthesizing speech with pyttsx3...")
         speech = make_speech_wav(answer)
+        print(f"    Speech WAV ready: {len(speech)} bytes")
 
         return Response(
             content=speech,
@@ -175,8 +199,9 @@ async def voice(request: Request):
         )
 
     except Exception as error:
-        print("VOICE ERROR:", repr(error))
-        raise HTTPException(500, str(error))
+        print("\n!!! VOICE PROCESSING ERROR !!!")
+        traceback.print_exc()
+        raise HTTPException(500, detail=str(error))
 
 
 if __name__ == "__main__":
