@@ -5,6 +5,8 @@ import tempfile
 import wave
 import threading
 import traceback
+import shutil
+import subprocess
 
 import requests
 import pyttsx3
@@ -19,6 +21,13 @@ def _safe_av_open(*args, **kwargs):
     kwargs.pop("metadata_errors", None)
     return _orig_av_open(*args, **kwargs)
 av.open = _safe_av_open
+
+# Fix pyttsx3 espeak voice bug on Linux (where default voice was mistakenly set to 'gmw/en')
+try:
+    import pyttsx3.drivers.espeak as espeak_driver
+    espeak_driver.EspeakDriver._defaultVoice = "en"
+except Exception:
+    pass
 
 try:
     import audioop
@@ -116,36 +125,51 @@ def ask_ai(message):
 
 def make_speech_wav(text):
     """Create speech and convert it to 16 kHz mono PCM WAV."""
-    with tts_lock:
-        engine = pyttsx3.init()
+    with tempfile.TemporaryDirectory() as folder:
+        original = os.path.join(folder, "speech_original.wav")
+        generated = False
 
-        with tempfile.TemporaryDirectory() as folder:
-            original = os.path.join(folder, "speech_original.wav")
-            engine.save_to_file(text, original)
-            engine.runAndWait()
-            engine.stop()
-
-            # Read speech WAV. Windows voices may use another
-            # sample rate, channel count, or sample width.
-            with wave.open(original, "rb") as source:
-                channels = source.getnchannels()
-                width = source.getsampwidth()
-                rate = source.getframerate()
-                frames = source.readframes(source.getnframes())
-
-            # Convert samples to signed 16-bit mono.
-            if width != 2:
-                frames = audioop.lin2lin(frames, width, 2)
-
-            if channels == 2:
-                frames = audioop.tomono(frames, 2, 0.5, 0.5)
-
-            if rate != 16000:
-                frames, _ = audioop.ratecv(
-                    frames, 2, 1, rate, 16000, None
+        # On Linux / EC2: prefer direct espeak-ng / espeak CLI (avoids pyttsx3 threading/voice bugs)
+        tts_cmd = shutil.which("espeak-ng") or shutil.which("espeak")
+        if tts_cmd:
+            try:
+                subprocess.run(
+                    [tts_cmd, "-v", "en", "-w", original, text],
+                    check=True,
+                    timeout=20
                 )
+                if os.path.exists(original) and os.path.getsize(original) > 44:
+                    generated = True
+            except Exception as e:
+                print("espeak CLI warning:", e)
 
-            return make_wav(frames, 16000)
+        # Fallback to pyttsx3 (for Windows or if CLI is not found)
+        if not generated:
+            with tts_lock:
+                engine = pyttsx3.init()
+                engine.save_to_file(text, original)
+                engine.runAndWait()
+                engine.stop()
+
+        # Read speech WAV and convert to signed 16-bit mono 16 kHz PCM
+        with wave.open(original, "rb") as source:
+            channels = source.getnchannels()
+            width = source.getsampwidth()
+            rate = source.getframerate()
+            frames = source.readframes(source.getnframes())
+
+        if width != 2:
+            frames = audioop.lin2lin(frames, width, 2)
+
+        if channels == 2:
+            frames = audioop.tomono(frames, 2, 0.5, 0.5)
+
+        if rate != 16000:
+            frames, _ = audioop.ratecv(
+                frames, 2, 1, rate, 16000, None
+            )
+
+        return make_wav(frames, 16000)
 
 
 @app.post("/voice")
@@ -185,7 +209,7 @@ async def voice(request: Request):
         answer = ask_ai(transcript)
         print(f"    AI Answer: '{answer}'")
 
-        print("--> [Step 4] Synthesizing speech with pyttsx3...")
+        print("--> [Step 4] Synthesizing speech...")
         speech = make_speech_wav(answer)
         print(f"    Speech WAV ready: {len(speech)} bytes")
 
