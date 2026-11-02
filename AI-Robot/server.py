@@ -148,8 +148,11 @@ def make_speech_wav(text):
         tts_cmd = shutil.which("espeak-ng") or shutil.which("espeak")
         if tts_cmd:
             try:
+                # -v en-us: Clearer American English pronunciation
+                # -s 145: Slightly slower pace for high intelligibility on small speakers (default 175 is rushed)
+                # -a 200: Maximum clean amplitude (default is 100)
                 subprocess.run(
-                    [tts_cmd, "-v", "en", "-w", original, text],
+                    [tts_cmd, "-v", "en-us", "-s", "145", "-a", "200", "-w", original, text],
                     check=True,
                     timeout=20
                 )
