@@ -218,7 +218,8 @@ size_t recordAudio(std::vector<uint8_t*>& chunks) {
 }
 
 // ======================== Send Voice & Play Reply ========================
-// Streams chunks directly via WiFiClient to /voice and plays back returned WAV
+// Sends recorded audio to /voice, downloads the full WAV response into RAM,
+// then plays it back from memory for smooth, uninterrupted audio.
 bool sendVoiceAndPlay(const std::vector<uint8_t*>& chunks, size_t totalBytes) {
   if (chunks.empty() || totalBytes == 0) return false;
 
@@ -347,83 +348,145 @@ bool sendVoiceAndPlay(const std::vector<uint8_t*>& chunks, size_t totalBytes) {
     }
   }
 
+  // ---- Print conversation to Serial Monitor ----
+  Serial.println("========================================");
   if (transcript.length() > 0) {
-    Serial.println("You said: " + transcript);
+    Serial.println("  YOU:   " + transcript);
+  } else {
+    Serial.println("  YOU:   (no speech detected)");
   }
   if (reply.length() > 0) {
-    Serial.println("AI Reply: " + reply);
+    Serial.println("  ROBOT: " + reply);
+  } else {
+    Serial.println("  ROBOT: (no reply)");
+  }
+  Serial.println("========================================");
+
+  // ============================================================
+  // Download the ENTIRE WAV response into RAM before playing.
+  // This eliminates choppy audio caused by Wi-Fi jitter/latency.
+  // ============================================================
+  Serial.println("Downloading audio response...");
+
+  std::vector<uint8_t*> audioChunks;
+  size_t audioTotalBytes = 0;
+  uint8_t* curChunk = (uint8_t*)malloc(CHUNK_SIZE);
+  size_t curPos = 0;
+
+  if (!curChunk) {
+    Serial.println("Not enough memory for audio buffer!");
+    client->stop();
+    return false;
   }
 
-  // Skip the 44-byte WAV header so we stream pure PCM to the speaker
-  int headerToSkip = 44;
-  unsigned long skipStart = millis();
-  while (headerToSkip > 0 && (client->connected() || client->available())) {
+  unsigned long dlTimeout = millis();
+  while (client->connected() || client->available()) {
     int avail = client->available();
     if (avail > 0) {
-      int toRead = min(avail, headerToSkip);
-      uint8_t dummy[44];
-      int r = client->readBytes((char*)dummy, toRead);
-      if (r > 0) headerToSkip -= r;
+      size_t wanted = min((int)(CHUNK_SIZE - curPos), avail);
+      int got = client->readBytes((char*)(curChunk + curPos), wanted);
+      if (got > 0) {
+        curPos += got;
+        audioTotalBytes += got;
+        dlTimeout = millis();  // reset timeout on data received
+
+        if (curPos >= CHUNK_SIZE) {
+          audioChunks.push_back(curChunk);
+          curChunk = (uint8_t*)malloc(CHUNK_SIZE);
+          curPos = 0;
+          if (!curChunk) {
+            Serial.println("Memory limit during download, playing what we have.");
+            break;
+          }
+        }
+      }
     } else {
-      if (millis() - skipStart > 10000) break;
+      if (!client->connected()) break;
+      if (millis() - dlTimeout > 5000) break;  // 5-second idle timeout
       delay(2);
+    }
+  }
+
+  // Keep any partial last chunk
+  if (curChunk) {
+    if (curPos > 0) {
+      audioChunks.push_back(curChunk);
+    } else {
+      free(curChunk);
+    }
+  }
+
+  client->stop();  // Done with network — free the socket immediately
+
+  Serial.printf("Downloaded %u bytes audio (%u chunks)\n",
+                (unsigned int)audioTotalBytes,
+                (unsigned int)audioChunks.size());
+
+  if (audioTotalBytes <= 44) {
+    Serial.println("No audio data received!");
+    for (uint8_t* c : audioChunks) free(c);
+    return false;
+  }
+
+  // Skip the 44-byte WAV header so we play pure PCM
+  size_t skipRemaining = 44;
+  size_t chunkIdx = 0;
+  size_t byteIdx = 0;
+
+  while (skipRemaining > 0 && chunkIdx < audioChunks.size()) {
+    size_t chunkLen = (chunkIdx == audioChunks.size() - 1)
+        ? (audioTotalBytes - chunkIdx * CHUNK_SIZE)
+        : CHUNK_SIZE;
+    size_t canSkip = min(skipRemaining, chunkLen - byteIdx);
+    byteIdx += canSkip;
+    skipRemaining -= canSkip;
+    if (byteIdx >= chunkLen) {
+      chunkIdx++;
+      byteIdx = 0;
+    }
+  }
+
+  // Ensure 16-bit sample alignment
+  if (byteIdx % 2 != 0) {
+    byteIdx++;
+    if (chunkIdx < audioChunks.size()) {
+      size_t chunkLen = (chunkIdx == audioChunks.size() - 1)
+          ? (audioTotalBytes - chunkIdx * CHUNK_SIZE)
+          : CHUNK_SIZE;
+      if (byteIdx >= chunkLen) {
+        chunkIdx++;
+        byteIdx = 0;
+      }
     }
   }
 
   face("talk");
   digitalWrite(LED_PIN, HIGH);
 
-  // Pre-buffer: wait until at least 4 KB is received so playback starts smoothly without stutter
-  unsigned long preBufferStart = millis();
-  while (client->connected() && client->available() < 16384 && millis() - preBufferStart < 1500) {
-    delay(10);
-  }
+  // Play back from RAM — perfectly smooth, no network dependency
+  while (chunkIdx < audioChunks.size() && speakerReady) {
+    size_t chunkLen = (chunkIdx == audioChunks.size() - 1)
+        ? (audioTotalBytes - chunkIdx * CHUNK_SIZE)
+        : CHUNK_SIZE;
 
-  uint8_t buffer[1024];
-  uint8_t carryByte = 0;
-  bool hasCarry = false;
-  unsigned long lastDataTime = millis();
+    size_t playLen = chunkLen - byteIdx;
 
-  // Stream audio chunks directly to I2S speaker with strict 16-bit sample alignment
-  while (client->connected() || client->available() || hasCarry) {
-    int avail = client->available();
-    if (avail > 0 || hasCarry) {
-      size_t offset = 0;
-      if (hasCarry) {
-        buffer[0] = carryByte;
-        offset = 1;
-        hasCarry = false;
-      }
+    // Maintain 16-bit alignment
+    if (playLen % 2 != 0) playLen--;
 
-      size_t wanted = min((int)(sizeof(buffer) - offset), avail);
-      int got = 0;
-      if (wanted > 0) {
-        got = client->readBytes((char*)buffer + offset, wanted);
-      }
-
-      size_t total = offset + (got > 0 ? got : 0);
-
-      // 16-bit PCM samples must be strictly 2-byte aligned.
-      // If an odd byte arrived, save it for the next chunk to prevent High/Low byte swapping & harsh static!
-      if (total % 2 != 0) {
-        carryByte = buffer[total - 1];
-        hasCarry = true;
-        total--;
-      }
-
-      if (total > 0 && speakerReady) {
-        speaker.write(buffer, total);
-      }
-      lastDataTime = millis();
-    } else {
-      if (!client->connected() && client->available() == 0) break;
-      if (millis() - lastDataTime > 3000) break; // 3-second stream timeout
-      delay(2);
+    if (playLen > 0) {
+      speaker.write(audioChunks[chunkIdx] + byteIdx, playLen);
     }
+
+    chunkIdx++;
+    byteIdx = 0;
   }
+
+  // Free all downloaded audio chunks
+  for (uint8_t* c : audioChunks) free(c);
+  audioChunks.clear();
 
   digitalWrite(LED_PIN, LOW);
-  client->stop();
   face("happy");
   return true;
 }
@@ -465,7 +528,7 @@ void setup() {
 
   connectWiFi();
 
-  Serial.printf("Free Heap: %u bytes (Largest Contiguous Block: %u bytes)\n",
+  Serial.printf("Free Heap: %u bytes (Largest Block: %u bytes)\n",
                 ESP.getFreeHeap(),
                 ESP.getMaxAllocHeap());
 
@@ -499,19 +562,21 @@ void loop() {
     size_t totalBytes = recordAudio(chunks);
 
     if (totalBytes > 0) {
-      if (!sendVoiceAndPlay(chunks, totalBytes)) {
+      // Free recording chunks BEFORE downloading response to maximize available RAM for playback
+      std::vector<uint8_t*> sendChunks = chunks;
+      chunks.clear();
+
+      if (!sendVoiceAndPlay(sendChunks, totalBytes)) {
         Serial.println("AI voice request failed");
         face("sad");
       }
+
+      // Free recording chunks (sendVoiceAndPlay doesn't free these)
+      for (uint8_t* c : sendChunks) free(c);
+      sendChunks.clear();
     } else {
       face("happy");
     }
-
-    // Clean up all allocated chunks from heap
-    for (uint8_t* c : chunks) {
-      free(c);
-    }
-    chunks.clear();
 
     digitalWrite(LED_PIN, LOW);
 
