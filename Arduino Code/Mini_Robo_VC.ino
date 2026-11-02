@@ -375,7 +375,7 @@ bool sendVoiceAndPlay(const std::vector<uint8_t*>& chunks, size_t totalBytes) {
 
   // Pre-buffer: wait until at least 4 KB is received so playback starts smoothly without stutter
   unsigned long preBufferStart = millis();
-  while (client->connected() && client->available() < 4096 && millis() - preBufferStart < 1500) {
+  while (client->connected() && client->available() < 16384 && millis() - preBufferStart < 1500) {
     delay(10);
   }
 
